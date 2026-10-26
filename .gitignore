@@ -1,0 +1,7 @@
+# Personal learning context stays out of the public repo
+/devpost/learner-profile.md
+
+# Local credential files (the Supabase publishable key in config.js is public by design)
+.env
+.env.*
+!.env.example

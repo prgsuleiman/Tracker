@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Lost Mode · Dashboard</title>
+<link rel="manifest" href="manifest-dashboard.json">
+<link rel="apple-touch-icon" href="icon-192.png">
+<meta name="theme-color" content="#0f1115">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  :root { --bg:#0f1115; --card:#181b22; --line:#2a2f3a; --text:#e8eaf0; --mute:#9aa1b2; --ok:#30a46c; --bad:#e5484d; --off:#8b8d98; --accent:#4c8dff; }
+  * { box-sizing: border-box; }
+  html, body { height:100%; }
+  body { margin:0; font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--text); display:flex; flex-direction:column; }
+  header { display:flex; justify-content:space-between; align-items:center; padding:12px 16px; border-bottom:1px solid var(--line); }
+  header h1 { font-size:18px; margin:0; }
+  header a { color:var(--accent); text-decoration:none; font-size:14px; }
+  #banner { background:#3a1f22; color:#ffb4b8; padding:10px 16px; border-bottom:1px solid #6b2b30; }
+  main { flex:1; display:grid; grid-template-columns:340px 1fr; min-height:0; }
+  aside { border-right:1px solid var(--line); overflow:auto; padding:14px; }
+  #map { min-height:300px; }
+  .dev { display:flex; align-items:center; gap:10px; padding:10px 12px; border:1px solid var(--line); border-radius:12px; margin-bottom:8px; background:var(--card); cursor:pointer; }
+  .dev.sel { border-color:var(--accent); }
+  .dev .dot { width:11px; height:11px; border-radius:50%; flex:none; }
+  .dev small { color:var(--mute); display:block; }
+  .dev b { word-break:break-word; }
+  .tag { margin-left:auto; font-size:12px; padding:2px 8px; border-radius:99px; border:1px solid var(--line); color:var(--mute); }
+  .tag.lost { color:#fff; background:var(--bad); border-color:var(--bad); }
+  #panel { margin-top:14px; background:var(--card); border:1px solid var(--line); border-radius:14px; padding:16px; }
+  #panel h2 { margin:0 0 4px; font-size:17px; }
+  #panel p { margin:4px 0 10px; color:var(--mute); }
+  label { display:block; color:var(--mute); font-size:13px; margin:12px 0 5px; }
+  textarea, input { width:100%; padding:10px; border-radius:10px; border:1px solid var(--line); background:#0f1115; color:var(--text); font:inherit; }
+  textarea { min-height:84px; resize:vertical; }
+  button { width:100%; margin-top:12px; padding:11px; border:0; border-radius:10px; font:inherit; font-weight:600; cursor:pointer; color:#fff; background:var(--accent); }
+  button.danger { background:var(--bad); } button.ok { background:var(--ok); }
+  button.ghost { background:transparent; border:1px solid var(--line); color:var(--mute); font-weight:400; }
+  .alert { background:#3a1f22; border:1px solid #6b2b30; border-radius:10px; padding:10px; color:#ffb4b8; white-space:pre-wrap; word-break:break-word; }
+  a.gm { color:var(--accent); }
+  .empty { color:var(--mute); padding:8px 2px; }
+  @media (max-width:760px) { main { grid-template-columns:1fr; grid-template-rows:auto 340px; } aside { border-right:0; border-bottom:1px solid var(--line); } }
+</style>
+</head>
+<body>
+<header><h1>Lost Mode</h1><a href="device.html" target="_blank">Open the device page ↗</a></header>
+<div id="banner" hidden></div>
+<main>
+  <aside>
+    <div id="list"></div>
+    <div id="panel"></div>
+  </aside>
+  <div id="map"></div>
+</main>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="config.js"></script>
+<script src="api.js"></script>
+<script>
+(function () {
+  const $ = (s) => document.querySelector(s);
+  const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  const COLORS = { lost: "#e5484d", online: "#30a46c", offline: "#8b8d98" };
+
+  let devices = [], selId = null, panelSig = "", markers = {}, accCircle = null, fitted = false;
+
+  const map = L.map("map").setView([9.0, 8.0], 5); // Nigeria-ish default view
+  L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom: 19, attribution: "© OpenStreetMap contributors" }).addTo(map);
+
+  function ago(iso) {
+    if (!iso) return "never";
+    const s = Math.max(0, (Date.now() - new Date(iso)) / 1000);
+    if (s < 60) return Math.round(s) + " s ago";
+    if (s < 3600) return Math.round(s / 60) + " min ago";
+    if (s < 86400) return Math.round(s / 3600) + " h ago";
+    return Math.round(s / 86400) + " d ago";
+  }
+  const isOnline = (d) => d.last_seen && Date.now() - new Date(d.last_seen) < 90000;
+  const status = (d) => (d.lost ? "lost" : isOnline(d) ? "online" : "offline");
+  const selected = () => devices.find((d) => d.id === selId);
+
+  function banner(msg) { const b = $("#banner"); b.textContent = msg || ""; b.hidden = !msg; }
+
+  async function refresh() {
+    if (!API.configured) { banner("Not configured yet: put your Supabase URL and key in config.js."); return; }
+    try {
+      devices = await API.list();
+      banner("");
+      if (selId && !selected()) selId = null;
+      drawList(); drawMarkers(); drawPanel();
+    } catch (e) { banner("Cannot reach the database: " + e.message); }
+  }
+
+  function drawList() {
+    if (!devices.length) { $("#list").innerHTML = '<div class="empty">No devices yet. Open the device page on your phone or laptop and register it.</div>'; return; }
+    $("#list").innerHTML = devices.map((d) => {
+      const st = status(d);
+      return '<div class="dev ' + (d.id === selId ? "sel" : "") + '" data-id="' + esc(d.id) + '">' +
+        '<span class="dot" style="background:' + COLORS[st] + '"></span>' +
+        "<div><b>" + esc(d.name) + "</b><small>seen " + esc(ago(d.last_seen)) + "</small></div>" +
+        '<span class="tag ' + (st === "lost" ? "lost" : "") + '">' + st + "</span></div>";
+    }).join("");
+    document.querySelectorAll(".dev").forEach((el) => (el.onclick = () => select(el.dataset.id)));
+  }
+
+  function drawMarkers() {
+    const ids = new Set();
+    devices.forEach((d) => {
+      if (d.lat == null || d.lng == null) return;
+      ids.add(d.id);
+      const ll = [d.lat, d.lng], color = COLORS[status(d)];
+      let m = markers[d.id];
+      if (!m) {
+        m = markers[d.id] = L.circleMarker(ll, { radius: 11, weight: 3, color: "#fff", fillOpacity: 1 }).addTo(map);
+        m.on("click", () => select(d.id));
+      }
+      m.setLatLng(ll).setStyle({ fillColor: color }).bindTooltip(d.name);
+    });
+    Object.keys(markers).forEach((id) => { if (!ids.has(id)) { map.removeLayer(markers[id]); delete markers[id]; } });
+    if (!fitted && ids.size) {
+      fitted = true;
+      const pts = [...ids].map((id) => markers[id].getLatLng());
+      pts.length === 1 ? map.setView(pts[0], 15) : map.fitBounds(L.latLngBounds(pts), { padding: [40, 40] });
+    }
+    const s = selected();
+    if (accCircle) { map.removeLayer(accCircle); accCircle = null; }
+    if (s && s.lat != null && s.accuracy) {
+      accCircle = L.circle([s.lat, s.lng], { radius: s.accuracy, color: COLORS[status(s)], weight: 1, fillOpacity: 0.12 }).addTo(map);
+    }
+  }
+
+  function select(id) {
+    selId = id; panelSig = "";
+    drawList(); drawMarkers(); drawPanel();
+    const s = selected();
+    if (s && s.lat != null) map.setView([s.lat, s.lng], Math.max(map.getZoom(), 15));
+  }
+
+  function seenLine(d) {
+    if (d.lat == null) return "No location reported yet.";
+    const when = d.last_seen ? new Date(d.last_seen).toLocaleString() : "unknown time";
+    const label = isOnline(d) ? "Last signal" : "Stopped sending signals at";
+    return label + " " + esc(when) + " (" + esc(ago(d.last_seen)) + "), within " + Math.round(d.accuracy || 0) + ' m · <a class="gm" target="_blank" rel="noopener" href="https://www.google.com/maps?q=' + d.lat + "," + d.lng + '">open in Google Maps</a>';
+  }
+
+  function drawPanel() {
+    const d = selected(), panel = $("#panel");
+    if (!d) { panel.innerHTML = '<div class="empty">Select a device to lock it or see where it is.</div>'; panelSig = ""; return; }
+    const sig = d.id + "|" + d.lost + "|" + d.name;
+    if (sig === panelSig) { $("#seen").innerHTML = seenLine(d); return; }
+    panelSig = sig;
+    const defMsg = localStorage.getItem("lm_msg") || "This device is lost. Please call me on +234 ... and I will reward you.";
+    panel.innerHTML =
+      "<h2>" + esc(d.name) + '</h2><p id="seen">' + seenLine(d) + "</p>" +
+      (d.lost
+        ? '<div class="alert"><b>Lost mode is ON.</b>\n' + esc(d.message) + '</div><button class="ok" id="foundBtn">Mark as found (unlock)</button>'
+        : '<label for="msg">Message shown on the locked screen</label><textarea id="msg">' + esc(defMsg) + "</textarea>" +
+          '<label for="pin">Unlock PIN (4 to 8 digits)</label><input id="pin" inputmode="numeric" maxlength="8" autocomplete="off">' +
+          '<button class="danger" id="lostBtn">Lock this device (mark as lost)</button>') +
+      '<button class="ghost" id="delBtn">Remove device</button>';
+
+    if (d.lost) {
+      $("#foundBtn").onclick = async () => { await act(() => API.update(d.id, { lost: false })); };
+    } else {
+      $("#lostBtn").onclick = async () => {
+        const pin = $("#pin").value.trim(), msg = $("#msg").value.trim();
+        if (!/^\d{4,8}$/.test(pin)) { alert("Choose a PIN of 4 to 8 digits. You need it to unlock the device."); return; }
+        if (!msg) { alert("Write a message for the finder."); return; }
+        localStorage.setItem("lm_msg", msg);
+        await act(async () => API.update(d.id, { lost: true, message: msg, pin_hash: await sha256(pin) }));
+      };
+    }
+    $("#delBtn").onclick = async () => {
+      if (confirm("Remove " + d.name + " from your dashboard?")) { selId = null; await act(() => API.remove(d.id)); }
+    };
+  }
+
+  async function act(fn) {
+    try { await fn(); await refresh(); } catch (e) { alert("Failed: " + e.message); }
+  }
+
+  refresh();
+  setInterval(refresh, 8000);
+})();
+</script>
+<script>if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(function () {});</script>
+</body>
+</html>

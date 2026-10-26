@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#0f1115">
+<title>Lost Mode · Device</title>
+<link rel="manifest" href="manifest-device.json">
+<link rel="apple-touch-icon" href="icon-192.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<style>
+  :root { --bg:#0f1115; --card:#181b22; --line:#2a2f3a; --text:#e8eaf0; --mute:#9aa1b2; --ok:#30a46c; --bad:#e5484d; --accent:#4c8dff; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--text); }
+  main { max-width:480px; margin:0 auto; padding:24px 16px; }
+  h1 { font-size:22px; margin:0 0 4px; }
+  p.sub { color:var(--mute); margin:0 0 20px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:18px; margin-bottom:14px; }
+  label { display:block; font-size:14px; color:var(--mute); margin-bottom:6px; }
+  input { width:100%; padding:12px; border-radius:10px; border:1px solid var(--line); background:#0f1115; color:var(--text); font-size:16px; }
+  button { width:100%; margin-top:12px; padding:13px; border:0; border-radius:10px; background:var(--accent); color:#fff; font-size:16px; font-weight:600; cursor:pointer; }
+  button.ghost { background:transparent; border:1px solid var(--line); color:var(--mute); }
+  .row { display:flex; justify-content:space-between; gap:12px; padding:6px 0; border-bottom:1px solid var(--line); }
+  .row:last-child { border:0; }
+  .row span:first-child { color:var(--mute); }
+  .dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:6px; background:var(--mute); }
+  .dot.ok { background:var(--ok); } .dot.bad { background:var(--bad); }
+  .banner { background:#3a1f22; border:1px solid #6b2b30; color:#ffb4b8; padding:12px; border-radius:10px; margin-bottom:14px; }
+  small { color:var(--mute); }
+  /* Lock screen */
+  #lock { position:fixed; inset:0; z-index:9999; background:#8b0d14; color:#fff; display:none; flex-direction:column; align-items:center; justify-content:center; text-align:center; padding:28px; user-select:none; }
+  #lock.on { display:flex; }
+  #lock .icon { font-size:64px; }
+  #lock h2 { font-size:28px; margin:8px 0 12px; }
+  #lock .msg { font-size:20px; max-width:480px; white-space:pre-wrap; word-break:break-word; margin-bottom:28px; }
+  #lock input { max-width:240px; text-align:center; letter-spacing:6px; background:#fff; color:#111; border:0; }
+  #lock button { max-width:240px; background:#fff; color:#8b0d14; }
+  #lockErr { min-height:22px; margin-top:10px; color:#ffd2d4; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Lost Mode</h1>
+  <p class="sub">Device page. Keep this open on the device you want to protect.</p>
+  <div id="banner" class="banner" hidden></div>
+
+  <section id="register" class="card" hidden>
+    <label for="devName">Name this device</label>
+    <input id="devName" placeholder="e.g. My phone" autocomplete="off">
+    <button id="regBtn">Register this device</button>
+    <p><small>You will be asked for location permission. Choose "Allow".</small></p>
+  </section>
+
+  <section id="running" hidden>
+    <div class="card">
+      <div class="row"><span>Device</span><strong id="sName">-</strong></div>
+      <div class="row"><span>Connection</span><span id="sConn"><i class="dot"></i>starting</span></div>
+      <div class="row"><span>Location</span><span id="sLoc">waiting...</span></div>
+      <div class="row"><span>Last report</span><span id="sLast">-</span></div>
+    </div>
+    <p><small>If you mark this device as lost on your dashboard, this screen is replaced by your recovery message within about 10 seconds.</small></p>
+    <button class="ghost" id="forgetBtn">Unregister this device</button>
+  </section>
+</main>
+
+<div id="lock" role="alertdialog" aria-live="assertive">
+  <div class="icon">🔒</div>
+  <h2>This device is lost</h2>
+  <div class="msg" id="lockMsg"></div>
+  <div id="pinBox">
+    <input id="pinIn" type="password" inputmode="numeric" maxlength="8" placeholder="PIN" autocomplete="off">
+    <button id="unlockBtn">Unlock</button>
+  </div>
+  <div id="lockErr"></div>
+</div>
+
+<script src="config.js"></script>
+<script src="api.js"></script>
+<script>
+(function () {
+  const $ = (s) => document.querySelector(s);
+  let id = localStorage.getItem("lm_device_id");
+  let pos = null, current = null, lostNow = false, wake = null, timer = null;
+
+  function banner(msg) { const b = $("#banner"); b.textContent = msg; b.hidden = !msg; }
+  function conn(ok, text) { $("#sConn").innerHTML = '<i class="dot ' + (ok ? "ok" : "bad") + '"></i>' + text; }
+
+  async function init() {
+    if (!API.configured) { banner("Not configured yet: put your Supabase URL and key in config.js."); return; }
+    if (id) {
+      try {
+        const d = await API.get(id);
+        if (!d) { forget(); } else { current = d; }
+      } catch (e) { /* offline: keep going with the saved id */ }
+    }
+    id ? start() : $("#register").hidden = false;
+  }
+
+  $("#devName").value = guessName();
+  function guessName() {
+    const ua = navigator.userAgent;
+    if (/iPhone/.test(ua)) return "My iPhone";
+    if (/iPad/.test(ua)) return "My iPad";
+    if (/Android/.test(ua)) return "My Android phone";
+    if (/Windows/.test(ua)) return "My Windows laptop";
+    if (/Mac/.test(ua)) return "My Mac";
+    return "My device";
+  }
+
+  $("#regBtn").onclick = async () => {
+    const name = $("#devName").value.trim() || "My device";
+    $("#regBtn").disabled = true;
+    // Ask for location inside the tap so browsers show the permission prompt.
+    if (navigator.geolocation) navigator.geolocation.getCurrentPosition(() => {}, () => {});
+    try {
+      const d = await API.create(name);
+      id = d.id; current = d;
+      localStorage.setItem("lm_device_id", id);
+      $("#register").hidden = true;
+      start();
+    } catch (e) {
+      banner("Could not register: " + e.message);
+      $("#regBtn").disabled = false;
+    }
+  };
+
+  $("#forgetBtn").onclick = () => {
+    if (!confirm("Stop protecting this device? It stays on your dashboard until you remove it there.")) return;
+    forget(); location.reload();
+  };
+  function forget() { localStorage.removeItem("lm_device_id"); id = null; clearTimeout(timer); }
+
+  function start() {
+    $("#running").hidden = false;
+    $("#sName").textContent = current ? current.name : "(saved)";
+    watchLocation();
+    keepAwake();
+    loop();
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "visible") { keepAwake(); tick(); }
+    });
+  }
+
+  function watchLocation() {
+    if (!navigator.geolocation) { $("#sLoc").textContent = "not supported here"; return; }
+    navigator.geolocation.watchPosition(
+      (p) => {
+        pos = { lat: p.coords.latitude, lng: p.coords.longitude, accuracy: p.coords.accuracy };
+        $("#sLoc").textContent = "OK, within " + Math.round(pos.accuracy) + " m";
+      },
+      (e) => { $("#sLoc").textContent = "blocked: " + e.message + " (allow location for this site)"; },
+      { enableHighAccuracy: true, maximumAge: 10000, timeout: 30000 }
+    );
+  }
+
+  async function keepAwake() {
+    try { if ("wakeLock" in navigator && !wake) { wake = await navigator.wakeLock.request("screen"); wake.addEventListener("release", () => (wake = null)); } } catch (e) {}
+  }
+
+  async function tick() {
+    if (!id) return;
+    try {
+      const patch = { last_seen: new Date().toISOString() };
+      if (pos) Object.assign(patch, pos);
+      await API.update(id, patch);
+      const d = await API.get(id);
+      if (!d) { forget(); location.reload(); return; }
+      current = d;
+      $("#sName").textContent = d.name;
+      $("#sLast").textContent = new Date().toLocaleTimeString();
+      conn(true, "connected");
+      applyState(d);
+    } catch (e) {
+      conn(false, "offline, retrying");
+    }
+  }
+
+  function loop() {
+    tick().finally(() => { timer = setTimeout(loop, lostNow ? 10000 : 30000); });
+  }
+
+  // ---- Lock screen ----
+  function applyState(d) {
+    lostNow = !!d.lost;
+    const lock = $("#lock");
+    if (d.lost) {
+      $("#lockMsg").textContent = d.message || "This device is lost. Please contact its owner.";
+      $("#pinBox").style.display = d.pin_hash ? "" : "none";
+      if (!lock.classList.contains("on")) {
+        lock.classList.add("on");
+        document.body.style.overflow = "hidden";
+        if (navigator.vibrate) navigator.vibrate([300, 150, 300]);
+        document.title = "🔒 Lost device";
+        window.onbeforeunload = () => "This device is locked.";
+      }
+    } else if (lock.classList.contains("on")) {
+      unlockUI();
+    }
+  }
+  function unlockUI() {
+    $("#lock").classList.remove("on");
+    document.body.style.overflow = "";
+    document.title = "Lost Mode · Device";
+    window.onbeforeunload = null;
+    $("#pinIn").value = ""; $("#lockErr").textContent = "";
+  }
+
+  $("#unlockBtn").onclick = async () => {
+    const pin = $("#pinIn").value.trim();
+    if (!pin) return;
+    if ((await sha256(pin)) === (current && current.pin_hash)) {
+      try { await API.update(id, { lost: false }); } catch (e) {}
+      lostNow = false; unlockUI();
+    } else {
+      $("#lockErr").textContent = "Wrong PIN.";
+      $("#pinIn").value = "";
+    }
+  };
+  $("#pinIn").addEventListener("keydown", (e) => { if (e.key === "Enter") $("#unlockBtn").click(); });
+  document.addEventListener("contextmenu", (e) => { if ($("#lock").classList.contains("on")) e.preventDefault(); });
+
+  init();
+})();
+</script>
+<script>if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(function () {});</script>
+</body>
+</html>
